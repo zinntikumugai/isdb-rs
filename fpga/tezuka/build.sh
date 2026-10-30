@@ -28,7 +28,7 @@ WORK=${1:?usage: fpga/tezuka/build.sh WORKDIR [stock|isdb]}
 MODE=${2:-stock}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
-VIVADO_SETTINGS=${VIVADO_SETTINGS:?set VIVADO_SETTINGS to the path of Vivado's settings64.sh}
+VIVADO_SETTINGS=${VIVADO_SETTINGS:?"set VIVADO_SETTINGS to the path of Vivado's settings64.sh"}
 TEZUKA_REV=a304a1f7ecba49dc4cd9d57a7935ec52504c7334
 MAIA_REV=f7092ba
 

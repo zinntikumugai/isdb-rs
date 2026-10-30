@@ -10,7 +10,7 @@
 set -euo pipefail
 XSA=${1:?usage: sdbin.sh XSA OUT.bin}
 OUT=${2:?usage: sdbin.sh XSA OUT.bin}
-VIVADO_SETTINGS=${VIVADO_SETTINGS:?set VIVADO_SETTINGS to the path of Vivado's settings64.sh}
+VIVADO_SETTINGS=${VIVADO_SETTINGS:?"set VIVADO_SETTINGS to the path of Vivado's settings64.sh"}
 set +u
 # shellcheck disable=SC1090
 source "$VIVADO_SETTINGS"
