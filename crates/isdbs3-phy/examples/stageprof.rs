@@ -14,7 +14,7 @@ use isdbs3_phy::main_signal::{
     FrameInput, Ldpc, codeword_llrs, decode_frames, learned_points, main_symbols, nominal_points,
     pilots,
 };
-use isdbs3_phy::rx::{derotate, noise_of};
+use isdbs3_phy::rx::{RxOptions, derotate, noise_of, receive};
 use isdbs3_phy::sync::{synchronise, synchronise_at};
 use isdbs3_phy::{eq, tmcc};
 use std::time::Instant;
@@ -23,6 +23,7 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let frames: usize = a.get(2).map_or(24, |s| s.parse().unwrap());
     let bytes = std::fs::read(&a[1]).expect("read words");
+    let tp = Instant::now();
     let mut r = Reader::new();
     let mut ev = Vec::new();
     r.feed_bytes(&bytes, &mut ev);
@@ -40,6 +41,7 @@ fn main() {
         }
     }
     z.truncate((frames + 1) * FRAME_SYMBOLS);
+    println!("words parsed in {:.3} s", tp.elapsed().as_secs_f64());
     let secs = z.len() as f64 / 33.7561e6;
     println!("{} symbols = {secs:.3} s of signal", z.len());
     let off = synchronise(&z).expect("sync").offset;
@@ -113,6 +115,18 @@ fn main() {
         lap("decode_frames (all threads)", &mut log);
         let slots: usize = dec.iter().map(Vec::len).sum();
         println!("{} frames, {slots} slots, {nbits} code bits", preps.len());
+        let t = Instant::now();
+        let z0 = &z[off..];
+        let rx = receive(
+            z0,
+            &RxOptions {
+                slot_offset: Some(0),
+                carrier_hz: 1.0,
+                ..RxOptions::default()
+            },
+        );
+        log.push(("receive (as the stream calls it)", t.elapsed().as_secs_f64()));
+        assert!(!rx.slots.is_empty());
         for (name, s) in &log {
             println!("  {name:30} {s:7.3} s  ({:.2}× real time)", secs / s);
         }
