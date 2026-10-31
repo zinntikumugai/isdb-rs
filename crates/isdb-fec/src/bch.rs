@@ -146,6 +146,70 @@ pub fn encode(msg: &[u8]) -> Vec<u8> {
     c
 }
 
+/// A 192-bit register, bit i the coefficient of xⁱ: `[x⁰…x⁶³, x⁶⁴…x¹²⁷,
+/// x¹²⁸…x¹⁹¹]`.
+type Reg = [u64; 3];
+
+/// `(t(x) · x¹⁹²) mod g(x)` for every byte t (bit 7 the coefficient of
+/// x⁷): the byte-at-a-time division of [`is_codeword`].
+fn byte_table() -> &'static [Reg; 256] {
+    static TAB: OnceLock<Box<[Reg; 256]>> = OnceLock::new();
+    TAB.get_or_init(|| {
+        let g = generator();
+        let mut low: Reg = [0; 3]; // g(x) − x¹⁹²
+        for (i, &c) in g[..PARITY].iter().enumerate() {
+            low[i / 64] |= u64::from(c) << (i % 64);
+        }
+        let mut tab = Box::new([[0u64; 3]; 256]);
+        for (t, e) in tab.iter_mut().enumerate() {
+            let mut r: Reg = [0; 3];
+            for k in (0..8).rev() {
+                let fb = ((t >> k) & 1) as u64 ^ (r[2] >> 63);
+                r = [
+                    r[0] << 1,
+                    (r[1] << 1) | (r[0] >> 63),
+                    (r[2] << 1) | (r[1] >> 63),
+                ];
+                if fb == 1 {
+                    for (x, l) in r.iter_mut().zip(&low) {
+                        *x ^= l;
+                    }
+                }
+            }
+            *e = r;
+        }
+        tab
+    })
+}
+
+/// Whether `word` (transmission order, highest power first) is a
+/// codeword, i.e. g(x) divides it: the remainder of x¹⁹² w(x), a byte at
+/// a time like a CRC (leading zero bits pad the front to whole bytes and
+/// change nothing; x¹⁹² is prime to g, whose constant term is 1). The
+/// same answer as every syndrome S₁ … S₂ₜ being zero, since g is the
+/// least common multiple of the minimal polynomials of α … α²ᵗ.
+fn is_codeword(word: &[u8]) -> bool {
+    let tab = byte_table();
+    let mut r: Reg = [0; 3];
+    let lead = (8 - word.len() % 8) % 8;
+    let byte = |b: u8, r: &mut Reg| {
+        let e = &tab[usize::from(((r[2] >> 56) as u8) ^ b)];
+        *r = [
+            r[0] << 8 ^ e[0],
+            (r[1] << 8 | r[0] >> 56) ^ e[1],
+            (r[2] << 8 | r[1] >> 56) ^ e[2],
+        ];
+    };
+    let (head, rest) = word.split_at((8 - lead) % 8);
+    if lead != 0 {
+        byte(head.iter().fold(0u8, |a, &b| (a << 1) | (b & 1)), &mut r);
+    }
+    for c in rest.as_chunks::<8>().0 {
+        byte(c.iter().fold(0u8, |a, &b| (a << 1) | (b & 1)), &mut r);
+    }
+    r == [0; 3]
+}
+
 /// Too many errors for the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("BCH: uncorrectable")]
@@ -162,6 +226,10 @@ pub struct Uncorrectable;
 pub fn decode(word: &mut [u8]) -> Result<usize, Uncorrectable> {
     let n = word.len();
     assert!(n > PARITY && n <= N_MAX, "BCH length {n}");
+    // the usual case after LDPC: no error, found without the syndromes
+    if is_codeword(word) {
+        return Ok(0);
+    }
     let f = field();
     // word[j] is the coefficient of x^(n−1−j). Syndromes S_i = r(α^i),
     // i = 1..2t; for a binary code S_2i = S_i², but computing all is cheap
@@ -312,6 +380,26 @@ mod tests {
                 }
                 assert_eq!(decode(&mut r), Ok(e), "k {k} e {e}");
                 assert_eq!(r, c);
+            }
+        }
+    }
+
+    #[test]
+    fn codeword_check_agrees_with_the_syndromes() {
+        // every byte alignment of the front (n mod 8), codewords and words
+        // with 1 … 12 errors (all detectable: fewer than d = 25)
+        let mut rng = Lcg::new(7);
+        for k in (1000..1016).chain([34_312, 44_688]) {
+            let c = encode(&word(&mut rng, k));
+            assert!(is_codeword(&c), "k {k}");
+            let mut pos = std::collections::BTreeSet::new();
+            while pos.len() < T {
+                pos.insert(rng.below(c.len()));
+                let mut r = c.clone();
+                for &p in &pos {
+                    r[p] ^= 1;
+                }
+                assert!(!is_codeword(&r), "k {k}, {} errors", pos.len());
             }
         }
     }
