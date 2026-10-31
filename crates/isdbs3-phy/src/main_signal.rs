@@ -11,7 +11,7 @@
 //! transponder included: B44 §2 introduces the pilot "for restrain of
 //! deterioration" from the TWTA.
 
-use crate::sync::{SlotHead, phase_at};
+use crate::sync::{PhaseRamp, SlotHead};
 use crate::{Cplx, soft};
 use isdbs3_core::constellation::points;
 use isdbs3_core::dispersal::{SlotDispersal, pilot_signs};
@@ -42,8 +42,9 @@ pub fn main_symbols(z: &[Cplx], slots: &[SlotHead], f: usize) -> Option<Vec<Cplx
         if at + MOD_SLOT > z.len() {
             return None;
         }
+        let ramp = PhaseRamp::of(slots, i);
         for j in main_offsets() {
-            let (ph, amp) = phase_at(slots, i, j);
+            let (ph, amp) = ramp.at(j);
             out.push(z[at + j] / ph / amp.max(1e-30));
         }
     }
@@ -63,8 +64,9 @@ pub fn pilots(z: &[Cplx], slots: &[SlotHead], f: usize) -> Option<Vec<Cplx>> {
         if at + MOD_SLOT > z.len() {
             return None;
         }
+        let ramp = PhaseRamp::of(slots, i);
         for j in SYNC_SYMBOLS..SYNC_SYMBOLS + PILOT_SYMBOLS {
-            let (ph, amp) = phase_at(slots, i, j);
+            let (ph, amp) = ramp.at(j);
             let s = f64::from(signs[k * PILOT_SYMBOLS + j - SYNC_SYMBOLS]);
             out.push(z[at + j] / ph / amp.max(1e-30) * s);
         }
