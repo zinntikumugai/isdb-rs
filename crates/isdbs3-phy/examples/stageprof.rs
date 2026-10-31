@@ -125,7 +125,10 @@ fn main() {
                 ..RxOptions::default()
             },
         );
-        log.push(("receive (as the stream calls it)", t.elapsed().as_secs_f64()));
+        log.push((
+            "receive (as the stream calls it)",
+            t.elapsed().as_secs_f64(),
+        ));
         assert!(!rx.slots.is_empty());
         for (name, s) in &log {
             println!("  {name:30} {s:7.3} s  ({:.2}× real time)", secs / s);
