@@ -155,16 +155,45 @@ pub fn residual_hz(s: &Synced) -> Option<f64> {
 /// linearly between slot `i`'s head and the next one's (held after the
 /// last slot), and the amplitude likewise.
 pub fn phase_at(s: &[SlotHead], i: usize, j: usize) -> (Cplx, f64) {
-    let a = s[i];
-    let Some(b) = s.get(i + 1) else {
-        return (a.phase, a.amp);
-    };
-    let d = (b.phase * a.phase.conj()).arg();
-    let t = j as f64 / MOD_SLOT as f64;
-    (
-        a.phase * Cplx::from_polar(1.0, d * t),
-        a.amp + (b.amp - a.amp) * t,
-    )
+    PhaseRamp::of(s, i).at(j)
+}
+
+/// [`phase_at`] for every symbol of one slot: the phase step to the next
+/// head is taken once per slot instead of once per symbol, and
+/// [`PhaseRamp::at`] gives the same values bit for bit.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseRamp {
+    head: SlotHead,
+    /// The phase step to the next head and its amplitude; `None` after
+    /// the last slot (held).
+    next: Option<(f64, f64)>,
+}
+
+impl PhaseRamp {
+    /// The ramp of slot `i`.
+    pub fn of(s: &[SlotHead], i: usize) -> Self {
+        let a = s[i];
+        Self {
+            head: a,
+            next: s
+                .get(i + 1)
+                .map(|b| ((b.phase * a.phase.conj()).arg(), b.amp)),
+        }
+    }
+
+    /// The carrier phase and amplitude at symbol `j` of the slot.
+    #[inline]
+    pub fn at(&self, j: usize) -> (Cplx, f64) {
+        let a = self.head;
+        let Some((d, b_amp)) = self.next else {
+            return (a.phase, a.amp);
+        };
+        let t = j as f64 / MOD_SLOT as f64;
+        (
+            a.phase * Cplx::from_polar(1.0, d * t),
+            a.amp + (b_amp - a.amp) * t,
+        )
+    }
 }
 
 #[cfg(test)]
