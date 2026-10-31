@@ -92,11 +92,18 @@ impl SyncReport {
     }
 }
 
+/// The correlation of `x[at..at + SYNC_LEN]` with the sync word `r`
+/// (the reference `position_mags` is tested against).
+#[cfg(test)]
 fn corr(x: &[C], at: usize, r: &[C; SYNC_LEN]) -> C {
-    r.iter()
-        .zip(&x[at..at + SYNC_LEN])
-        .map(|(a, b)| b * a.conj())
-        .sum()
+    let w: &[C; SYNC_LEN] = x[at..at + SYNC_LEN].try_into().expect("a sync window");
+    corr_w(w, r)
+}
+
+/// The correlation of one window of `SYNC_LEN` symbols with the sync
+/// word `r`.
+fn corr_w(w: &[C; SYNC_LEN], r: &[C; SYNC_LEN]) -> C {
+    r.iter().zip(w).map(|(a, b)| b * a.conj()).sum()
 }
 
 /// Find the slot sync in `x` (symbols at one per symbol, any scale) and
@@ -125,7 +132,22 @@ fn measure_with(x: &[C], known: Option<usize>) -> Option<SyncReport> {
         return None;
     }
     let rms = (x.iter().map(C::norm_sqr).sum::<f64>() / x.len() as f64).sqrt();
-    let x: Vec<C> = x.iter().map(|v| v / rms.max(1e-30)).collect();
+    let norm = |v: &C| v / rms.max(1e-30);
+    // the symbols at unit RMS: all of them for a search; with the offset
+    // known only the sync windows are read, each normalised as it is read
+    // (the same values, without a copy of the whole input)
+    let full: Vec<C> = match known {
+        None => x.iter().map(norm).collect(),
+        Some(_) => Vec::new(),
+    };
+    let win = |at: usize| -> [C; SYNC_LEN] {
+        if full.is_empty() {
+            std::array::from_fn(|i| norm(&x[at + i]))
+        } else {
+            std::array::from_fn(|i| full[at + i])
+        }
+    };
+    let corr = |at: usize, r: &[C; SYNC_LEN]| corr_w(&win(at), r);
     let fs = sync_symbols(FSYNC);
     let ss = sync_symbols(SSYNC);
     let slots = (x.len() - SYNC_LEN) / SLOT;
@@ -133,12 +155,12 @@ fn measure_with(x: &[C], known: Option<usize>) -> Option<SyncReport> {
     // for a search, computed once for every position it visits; with the
     // offset known, only at the 33 offsets used below
     let m = match known {
-        None => position_mags(&x, slots * SLOT, &fs, &ss),
+        None => position_mags(&full, slots * SLOT, &fs, &ss),
         Some(_) => Vec::new(),
     };
     let at_pos = |n: usize| -> f64 {
         if m.is_empty() {
-            corr(&x, n, &fs).norm().max(corr(&x, n, &ss).norm()) / SYNC_LEN as f64
+            corr(n, &fs).norm().max(corr(n, &ss).norm()) / SYNC_LEN as f64
         } else {
             m[n]
         }
@@ -158,16 +180,16 @@ fn measure_with(x: &[C], known: Option<usize>) -> Option<SyncReport> {
     let parity = usize::from(
         (1..slots)
             .step_by(2)
-            .map(|k| corr(&x, at(k), &ss).norm())
+            .map(|k| corr(at(k), &ss).norm())
             .sum::<f64>()
             > (0..slots)
                 .step_by(2)
-                .map(|k| corr(&x, at(k), &ss).norm())
+                .map(|k| corr(at(k), &ss).norm())
                 .sum::<f64>(),
     );
     let (mut sig, mut err) = (0.0, 0.0);
     let mut add = |at: usize, r: &[C; SYNC_LEN], ph: C, amp: f64| {
-        for (a, b) in r.iter().zip(&x[at..at + SYNC_LEN]) {
+        for (a, b) in r.iter().zip(&win(at)) {
             let ideal = a * ph * amp;
             sig += ideal.norm_sqr();
             err += (b - ideal).norm_sqr();
@@ -175,7 +197,7 @@ fn measure_with(x: &[C], known: Option<usize>) -> Option<SyncReport> {
     };
     let mut ssync_phase = Vec::new();
     for k in (parity..slots).step_by(2) {
-        let r = corr(&x, at(k), &ss);
+        let r = corr(at(k), &ss);
         let (ph, amp) = (r / r.norm().max(1e-30), r.norm() / SYNC_LEN as f64);
         ssync_phase.push((k, ph, amp));
         add(at(k), &ss, ph, amp);
@@ -190,7 +212,7 @@ fn measure_with(x: &[C], known: Option<usize>) -> Option<SyncReport> {
         if nb.norm() == 0.0 {
             continue;
         }
-        let r = corr(&x, at(k), &fs);
+        let r = corr(at(k), &fs);
         if (r * nb.conj()).re < 0.0 {
             nfsync += 1;
         } else {
