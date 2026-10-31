@@ -15,7 +15,7 @@ use crate::sync::{SlotHead, phase_at};
 use crate::{Cplx, soft};
 use isdbs3_core::constellation::points;
 use isdbs3_core::dispersal::{SlotDispersal, pilot_signs};
-use isdbs3_core::interleave::permutation;
+use isdbs3_core::interleave::{Direction, direction, permutation};
 use isdbs3_core::params::{
     BCH_PARITY_BITS, HEADER_BITS, MAIN_RUN, MOD_SLOT, Modulation, N_LDPC, PILOT_SYMBOLS, RUNS,
     SLOTS, STUFF_BITS, SYNC_SYMBOLS, TMCC_RUN,
@@ -107,6 +107,21 @@ pub fn nominal_points(m: Modulation, r: isdbs3_core::CodeRate) -> Vec<Cplx> {
 pub fn demap(sym: &[Cplx], pts: &[Cplx], bits: usize, n0: f64, out: &mut Vec<f32>) {
     out.clear();
     out.reserve(sym.len() * bits);
+    // the constellations B44 uses, with the label loops unrolled at compile
+    // time: the same distances and minima as the general loop below
+    match (pts.len(), bits) {
+        (2, 1) => demap_n::<2, 1>(sym, pts, n0, out),
+        (4, 2) => demap_n::<4, 2>(sym, pts, n0, out),
+        (8, 3) => demap_n::<8, 3>(sym, pts, n0, out),
+        (16, 4) => demap_n::<16, 4>(sym, pts, n0, out),
+        (32, 5) => demap_n::<32, 5>(sym, pts, n0, out),
+        _ => demap_any(sym, pts, bits, n0, out),
+    }
+}
+
+/// [`demap`] for any number of points: the reference the unrolled forms
+/// match bit for bit.
+fn demap_any(sym: &[Cplx], pts: &[Cplx], bits: usize, n0: f64, out: &mut Vec<f32>) {
     let mut d = vec![0f64; pts.len()];
     for &y in sym {
         for (di, p) in d.iter_mut().zip(pts) {
@@ -122,6 +137,47 @@ pub fn demap(sym: &[Cplx], pts: &[Cplx], bits: usize, n0: f64, out: &mut Vec<f32
                 }
             }
             out.push(soft((m1 - m0) / n0));
+        }
+    }
+}
+
+/// [`demap`] for `N` = 2^`B` points: the label tests are constants once
+/// the loops unroll, so each bit's two minima are straight-line code.
+/// `(y - p).norm_sqr()` is spelled out as num-complex computes it
+/// (re² + im²), and min is exact, so the LLRs are bit for bit those of
+/// the general loop.
+#[inline(never)]
+fn demap_n<const N: usize, const B: usize>(
+    sym: &[Cplx],
+    pts: &[Cplx],
+    n0: f64,
+    out: &mut Vec<f32>,
+) {
+    let pr: [f64; N] = std::array::from_fn(|k| pts[k].re);
+    let pi: [f64; N] = std::array::from_fn(|k| pts[k].im);
+    let start = out.len();
+    out.resize(start + sym.len() * B, 0.0);
+    for (&y, o) in sym.iter().zip(out[start..].as_chunks_mut::<B>().0) {
+        let mut d = [0f64; N];
+        for k in 0..N {
+            let (dr, di) = (y.re - pr[k], y.im - pi[k]);
+            d[k] = dr * dr + di * di;
+        }
+        for (j, b) in (0..B).rev().enumerate() {
+            // `if x < m` is f64::min here: distances are never NaN
+            // (min ignores a NaN argument just as the comparison does)
+            // and never -0
+            let (mut m0, mut m1) = (f64::MAX, f64::MAX);
+            for (lab, &dk) in d.iter().enumerate() {
+                if (lab >> b) & 1 == 0 {
+                    if dk < m0 {
+                        m0 = dk;
+                    }
+                } else if dk < m1 {
+                    m1 = dk;
+                }
+            }
+            o[j] = soft((m1 - m0) / n0);
         }
     }
 }
@@ -205,12 +261,32 @@ pub fn codeword_llrs(ms: &[Cplx], s: &Slot, pts: &[Cplx], n0: f64) -> Vec<f32> {
     let sym = &ms[s.symbol_start..s.symbol_start + s.symbols];
     let mut lab = Vec::new();
     demap(sym, pts, s.modulation.bits(), n0, &mut lab);
-    let perm = permutation(s.modulation, s.rate);
+    let perm = cached_permutation(s.modulation, s.rate);
     let mut llr = vec![0f32; N_LDPC];
     for (i, &p) in perm.iter().enumerate() {
         llr[p as usize] = lab[i];
     }
     llr
+}
+
+/// [`permutation`] built once per (modulation, read-out direction), the
+/// two things it depends on: every codeword of a frame used to build its
+/// own 44 880-entry table.
+fn cached_permutation(m: Modulation, r: isdbs3_core::CodeRate) -> &'static [u32] {
+    static CACHE: [std::sync::OnceLock<Vec<u32>>; 15] = [const { std::sync::OnceLock::new() }; 15];
+    let mi = match m {
+        Modulation::Bpsk => 0,
+        Modulation::Qpsk => 1,
+        Modulation::Psk8 => 2,
+        Modulation::Apsk16 => 3,
+        Modulation::Apsk32 => 4,
+    };
+    let di = match direction(m, r) {
+        Direction::None => 0,
+        Direction::Forward => 1,
+        Direction::Backward => 2,
+    };
+    CACHE[mi * 3 + di].get_or_init(|| permutation(m, r))
 }
 
 /// A decoded codeword: slot index, LDPC iterations (`None`: not
@@ -422,6 +498,47 @@ fn workers() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrolled_demap_matches_the_general_loop() {
+        // received points around every constellation (noise, far outliers,
+        // ties on the points themselves), bit for bit
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut u = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let r = isdbs3_core::CodeRate::new(93).unwrap();
+        for m in [
+            Modulation::Bpsk,
+            Modulation::Qpsk,
+            Modulation::Psk8,
+            Modulation::Apsk16,
+            Modulation::Apsk32,
+        ] {
+            let pts = nominal_points(m, r);
+            let mut sym: Vec<Cplx> = (0..4000)
+                .map(|i| {
+                    pts[i % pts.len()] + Cplx::new(u(), u()) * if i % 7 == 0 { 8.0 } else { 0.4 }
+                })
+                .collect();
+            sym.extend(&pts);
+            for n0 in [0.01, 0.3, 2.0] {
+                let (mut fast, mut slow) = (Vec::new(), Vec::new());
+                demap(&sym, &pts, m.bits(), n0, &mut fast);
+                demap_any(&sym, &pts, m.bits(), n0, &mut slow);
+                assert_eq!(fast.len(), slow.len());
+                assert!(
+                    fast.iter()
+                        .zip(&slow)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{m:?} n0 {n0}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn spec_8976_main_symbols_per_slot() {
