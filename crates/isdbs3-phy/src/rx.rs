@@ -229,6 +229,11 @@ impl Front {
     pub fn sync_snr_eq_db(&self) -> Option<f64> {
         self.rx.sync_snr_eq_db
     }
+
+    /// [`Rx::prep_s`] so far.
+    pub fn prep_s(&self) -> f64 {
+        self.rx.prep_s
+    }
 }
 
 /// The first half of [`receive`] (its events are those of the sync, the

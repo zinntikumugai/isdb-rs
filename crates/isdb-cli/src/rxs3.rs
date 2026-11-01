@@ -18,7 +18,7 @@ use isdb_tlv::Assembler;
 use isdb_tlv::stats::StreamStats;
 use isdbs3_core::params::FRAME_SYMBOLS;
 use isdbs3_phy::frontend::{Prior, Symbols, Trim, symbols_with_prior};
-use isdbs3_phy::rx::{RxOptions, receive};
+use isdbs3_phy::rx::{Front, Rx, RxOptions, receive, receive_back, receive_front};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -169,6 +169,14 @@ pub struct Stats {
     pub chain: Option<crate::slotrx::ChainStats>,
     /// Which receiver decoded the slots, for the summary.
     pub decoded_by: &'static str,
+    /// Seconds of the receiver's stages, summed over its calls: before
+    /// the main signal's decode (sync, equaliser, TMCC, symbols), the
+    /// decode (LDPC), and the TLV assembly and writes.
+    pub prep_s: f64,
+    /// See `prep_s`.
+    pub ldpc_s: f64,
+    /// See `prep_s`.
+    pub emit_s: f64,
 }
 
 impl Default for Stats {
@@ -197,6 +205,9 @@ impl Default for Stats {
             residual_hz: None,
             tracked_hz: 0.0,
             tracked_range_hz: (0.0, 0.0),
+            prep_s: 0.0,
+            ldpc_s: 0.0,
+            emit_s: 0.0,
             tmcc: None,
             streams: BTreeMap::new(),
             words: None,
@@ -363,8 +374,26 @@ pub fn decode(
     let upto = keep_last.then(|| r.frame_starts.last().copied()).flatten();
     if keep_last && upto.is_none() {
         // no whole frame yet: keep everything for the next call
+        stats.prep_s += r.prep_s;
         return Ok(0);
     }
+    emit(&r, upto, asm, out, stats)?;
+    Ok(upto.unwrap_or(z.len()))
+}
+
+/// Count the frames and slots of `r` that start before `upto` (all of
+/// them with `None`) and write their TLV packets through `asm`: the part
+/// of [`decode`] after the receiver.
+fn emit(
+    r: &Rx,
+    upto: Option<usize>,
+    asm: &mut BTreeMap<u16, Assembler>,
+    out: &mut Outputs,
+    stats: &mut Stats,
+) -> Result<()> {
+    let te = std::time::Instant::now();
+    stats.prep_s += r.prep_s;
+    stats.ldpc_s += r.ldpc_s;
     // `r.frames[i]`, `r.frame_starts[i]` and the slots with `frame == i`
     // are the same frame (the receiver pushes one entry per frame in sync
     // order, up to the first incomplete one); a frame is taken when it
@@ -388,7 +417,8 @@ pub fn decode(
         count_slot(stats, sl.ldpc_iterations, sl.bch_corrected);
         push_slot(sl.stream_id, sl.data.as_deref(), sl.head, asm, out, stats)?;
     }
-    Ok(upto.unwrap_or(z.len()))
+    stats.emit_s += te.elapsed().as_secs_f64();
+    Ok(())
 }
 
 /// Count one valid slot's LDPC and BCH results.
@@ -461,6 +491,16 @@ pub fn report(stats: &Stats, secs: f64) {
             secs / stats.wall_s.max(1e-9),
             stats.back_s,
             w.max_queued_symbols as f64 / isdbs3_phy::frontend::system().symbol_rate_hz
+        );
+        info!(
+            target: "isdb::rx",
+            prep_s = stats.prep_s,
+            ldpc_s = stats.ldpc_s,
+            emit_s = stats.emit_s,
+            "stages: sync and preparation {:.2} s, LDPC {:.2} s, TLV {:.2} s",
+            stats.prep_s,
+            stats.ldpc_s,
+            stats.emit_s
         );
         info!(
             target: "isdb::rx",
@@ -704,11 +744,31 @@ pub fn run_file(
 /// noise).
 pub const TRACK_MIN_SNR_DB: f64 = 3.0;
 
+/// A chunk's front for the back of [`run_stream`], or the end of a
+/// contiguous stretch, in stream order.
+enum Back {
+    /// A front and where the chunk is cut (`None`: taken whole).
+    Chunk {
+        front: Box<Front>,
+        upto: Option<usize>,
+    },
+    /// The stretch ended: close its assemblers.
+    End,
+}
+
 /// Streamed reception: decode the `Symbols` words of `bytes` (a radio's
 /// FPGA front end, or a words file) as one continuous stream, cut on frame
 /// boundaries ([`crate::symstream`]); a loss in the words ends a contiguous
 /// stretch (the streams are discontinuous there, reported). Returns the
 /// seconds of signal (symbols / `symbol_rate_hz`).
+///
+/// Two threads: the stream's thread runs each chunk's front
+/// ([`receive_front`]: sync, equaliser, each frame's TMCC and symbols),
+/// which decides where the chunk is cut and the carrier the next one
+/// removes, and hands it on; this thread decodes the fronts
+/// ([`receive_back`]: LDPC, BCH) and writes their TLV packets, in order.
+/// The next chunk's sync so overlaps the previous chunk's LDPC, and the
+/// output is what one thread doing both gives.
 pub fn run_stream(
     bytes: crate::symstream::Bytes,
     source: crate::symstream::Source,
@@ -719,90 +779,157 @@ pub fn run_stream(
     stats: &mut Stats,
 ) -> Result<f64> {
     let t0 = std::time::Instant::now();
-    let stats = std::cell::RefCell::new(stats);
-    let asm = std::cell::RefCell::new(BTreeMap::<u16, Assembler>::new());
-    // whether the buffer starts where the previous call cut (a frame start)
-    let aligned = std::cell::Cell::new(false);
-    // the carrier offset tracked in the symbols: the front end's NCO is
-    // fixed at the acquisition's offset and the signal drifts (−22 Hz/s on
-    // a live stream, plan §0.18), so each call removes what the previous
-    // ones measured. Kept across losses: the drift is the signal's.
-    let tracked = std::cell::Cell::new(0.0f64);
-    let mut next_status = 1.0;
-    let w = crate::symstream::run(
-        bytes,
-        source,
-        crate::symstream::CHUNK_FRAMES * FRAME_SYMBOLS,
-        stop,
-        |z, cut| {
-            let t = std::time::Instant::now();
-            let mut st = stats.borrow_mut();
-            let more = cut == crate::symstream::Cut::More;
-            let used = decode(
-                z,
-                more,
-                aligned.get(),
-                tracked.get(),
-                &mut asm.borrow_mut(),
-                out,
-                &mut st,
-            )?;
-            if let Some(r) = st.residual_hz
-                && st.sync_snr_db > TRACK_MIN_SNR_DB
-            {
-                let f = tracked.get() + r;
-                tracked.set(f);
-                st.tracked_hz = f;
-                st.tracked_range_hz = (st.tracked_range_hz.0.min(f), st.tracked_range_hz.1.max(f));
+    let ldpc = stats.ldpc;
+    let stats = std::sync::Mutex::new(stats);
+    let lock = || {
+        stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    // one front waits while the back decodes another: at most two chunks'
+    // fronts exist at once besides the one being made
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Back>(1);
+    let (w, back) = std::thread::scope(|sc| {
+        // the front owns the senders: when it returns they drop and the
+        // back's loop ends
+        let front = sc.spawn(move || {
+            let tx_end = tx.clone();
+            // whether the buffer starts where the previous call cut (a frame start)
+            let mut aligned = false;
+            // the carrier offset tracked in the symbols: the front end's NCO
+            // is fixed at the acquisition's offset and the signal drifts
+            // (−22 Hz/s on a live stream, plan §0.18), so each call removes
+            // what the previous ones measured. Kept across losses: the drift
+            // is the signal's.
+            let mut tracked = 0.0f64;
+            let mut next_status = 1.0;
+            crate::symstream::run(
+                bytes,
+                source,
+                crate::symstream::CHUNK_FRAMES * FRAME_SYMBOLS,
+                stop,
+                |z, cut| {
+                    let t = std::time::Instant::now();
+                    let more = cut == crate::symstream::Cut::More;
+                    let f = receive_front(
+                        z,
+                        &RxOptions {
+                            ldpc,
+                            // a continuing stream is cut on a frame start (slot head at 0)
+                            slot_offset: aligned.then_some(0),
+                            carrier_hz: tracked,
+                            ..RxOptions::default()
+                        },
+                    );
+                    let upto = more.then(|| f.frame_starts().last().copied()).flatten();
+                    {
+                        let mut st = lock();
+                        st.residual_hz = f.residual_hz();
+                        st.sync_snr_db = f.sync_snr_db();
+                        st.sync_snr_eq_db = f.sync_snr_eq_db();
+                        if let Some(r) = st.residual_hz
+                            && st.sync_snr_db > TRACK_MIN_SNR_DB
+                        {
+                            tracked += r;
+                            st.tracked_hz = tracked;
+                            st.tracked_range_hz = (
+                                st.tracked_range_hz.0.min(tracked),
+                                st.tracked_range_hz.1.max(tracked),
+                            );
+                        }
+                        st.back_s += t.elapsed().as_secs_f64();
+                    }
+                    let used = if more && upto.is_none() {
+                        // no whole frame yet: keep everything for the next call
+                        lock().prep_s += f.prep_s();
+                        0
+                    } else {
+                        let front = Box::new(f);
+                        if tx.send(Back::Chunk { front, upto }).is_err() {
+                            bail!("the receiver's decode stopped");
+                        }
+                        upto.unwrap_or(z.len())
+                    };
+                    // the next buffer starts at the cut (a frame start) when
+                    // this call cut on one; after a loss or with nothing cut, not
+                    aligned = more && used > 0;
+                    Ok(used)
+                },
+                |_| {
+                    // a contiguous stretch ended: its assemblers close after
+                    // the chunks before it are written
+                    if tx_end.send(Back::End).is_err() {
+                        bail!("the receiver's decode stopped");
+                    }
+                    Ok(())
+                },
+                |w| {
+                    let mut st = lock();
+                    st.words = Some(*w);
+                    st.wall_s = t0.elapsed().as_secs_f64();
+                    let secs = w.symbols as f64 / symbol_rate_hz;
+                    if status && secs >= next_status {
+                        next_status = secs.floor() + 1.0;
+                        info!(
+                            target: "isdb::rx",
+                            seconds = secs,
+                            wall_s = st.wall_s,
+                            frames = st.frames,
+                            tmcc_ok = st.tmcc_ok,
+                            slots = st.slots,
+                            ldpc_failed = st.ldpc_failed,
+                            bch_failed = st.bch_failed,
+                            losses = w.losses,
+                            blocks_lost = w.blocks_lost,
+                            mer_db = st.mer_db().unwrap_or(f64::NAN),
+                            queued_s = w.queued_symbols as f64 / symbol_rate_hz,
+                            "{secs:.2} s of signal after {:.2} s: {} frames, TMCC ok {}; {} slots, LDPC failed {}, BCH failed {}; losses {} ({} blocks); MER {}; {:.1} s queued",
+                            st.wall_s,
+                            st.frames,
+                            st.tmcc_ok,
+                            st.slots,
+                            st.ldpc_failed,
+                            st.bch_failed,
+                            w.losses,
+                            w.blocks_lost,
+                            st.mer_db().map_or("-".into(), |m| format!("{m:.1} dB")),
+                            w.queued_symbols as f64 / symbol_rate_hz
+                        );
+                    }
+                },
+            )
+        });
+        let back = (|| -> Result<()> {
+            let opt = RxOptions {
+                ldpc,
+                ..RxOptions::default()
+            };
+            let mut asm = BTreeMap::<u16, Assembler>::new();
+            for m in &rx {
+                match m {
+                    Back::Chunk { front, upto } => {
+                        let t = std::time::Instant::now();
+                        let r = receive_back(*front, &opt);
+                        let mut st = lock();
+                        emit(&r, upto, &mut asm, out, &mut st)?;
+                        st.back_s += t.elapsed().as_secs_f64();
+                    }
+                    Back::End => close(std::mem::take(&mut asm), &mut lock()),
+                }
             }
-            st.back_s += t.elapsed().as_secs_f64();
-            // the next buffer starts at the cut (a frame start) when this
-            // call cut on one; after a loss or with nothing cut, not
-            aligned.set(more && used > 0);
-            Ok(used)
-        },
-        |_| {
-            // a contiguous stretch ended: close its assemblers
-            let a = std::mem::take(&mut *asm.borrow_mut());
-            close(a, &mut stats.borrow_mut());
             Ok(())
-        },
-        |w| {
-            let mut st = stats.borrow_mut();
-            st.words = Some(*w);
-            st.wall_s = t0.elapsed().as_secs_f64();
-            let secs = w.symbols as f64 / symbol_rate_hz;
-            if status && secs >= next_status {
-                next_status = secs.floor() + 1.0;
-                info!(
-                    target: "isdb::rx",
-                    seconds = secs,
-                    wall_s = st.wall_s,
-                    frames = st.frames,
-                    tmcc_ok = st.tmcc_ok,
-                    slots = st.slots,
-                    ldpc_failed = st.ldpc_failed,
-                    bch_failed = st.bch_failed,
-                    losses = w.losses,
-                    blocks_lost = w.blocks_lost,
-                    mer_db = st.mer_db().unwrap_or(f64::NAN),
-                    queued_s = w.queued_symbols as f64 / symbol_rate_hz,
-                    "{secs:.2} s of signal after {:.2} s: {} frames, TMCC ok {}; {} slots, LDPC failed {}, BCH failed {}; losses {} ({} blocks); MER {}; {:.1} s queued",
-                    st.wall_s,
-                    st.frames,
-                    st.tmcc_ok,
-                    st.slots,
-                    st.ldpc_failed,
-                    st.bch_failed,
-                    w.losses,
-                    w.blocks_lost,
-                    st.mer_db().map_or("-".into(), |m| format!("{m:.1} dB")),
-                    w.queued_symbols as f64 / symbol_rate_hz
-                );
-            }
-        },
-    )?;
-    let mut st = stats.borrow_mut();
+        })();
+        // on an error here the front's next send fails and it stops
+        drop(rx);
+        let w = front
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+        (w, back)
+    });
+    // the decode's own error explains a front that stopped because of it
+    back?;
+    let w = w?;
+    let mut st = lock();
     st.words = Some(w);
     st.wall_s = t0.elapsed().as_secs_f64();
     Ok(w.symbols as f64 / symbol_rate_hz)
