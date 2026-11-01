@@ -277,3 +277,72 @@ fn isdbs3_front_then_back_is_receive_on_words() {
     let halves = receive_back(receive_front(&z, &opt), &opt);
     assert_eq!(untimed(halves), untimed(whole), "{path}");
 }
+
+/// A slice cut from the middle of a long words file acquires by itself:
+/// `ISDB_RS_ISDBS3_MIDFILE_WORDS` names such a slice (e.g. 12 s taken at
+/// 1/8 of the 3-hour BS-14 recording of 2026-11-01 with `dd`). The carrier
+/// there had drifted ≈ +2.5 kHz from the front end's NCO, beyond the
+/// ±908 Hz the SSync phase steps measure unambiguously: the slot sync
+/// held, but the residual came out an alias (+723 Hz), the FSync-parity
+/// slots' phases a half turn off, and no TMCC decoded in the whole slice.
+/// The first 25 frames, received cold, must decode every TMCC, and the
+/// carrier the receiver reports (`residual_hz`, what a stream tracks)
+/// must leave a residual inside the unambiguous range on the next call.
+#[test]
+fn isdbs3_mid_file_slice_acquires() {
+    use isdb_frontend::format::{Event, Reader};
+    use isdbs3_core::params::FRAME_SYMBOLS;
+    use isdbs3_phy::Cplx;
+    use std::io::Read;
+    let Ok(path) = std::env::var("ISDB_RS_ISDBS3_MIDFILE_WORDS") else {
+        eprintln!("SKIP isdbs3_mid_file_slice_acquires: ISDB_RS_ISDBS3_MIDFILE_WORDS not set");
+        return;
+    };
+    let want = 25 * FRAME_SYMBOLS;
+    let mut f = std::fs::File::open(&path).unwrap();
+    let (mut r, mut ev, mut z) = (Reader::new(), Vec::new(), Vec::<Cplx>::new());
+    let mut buf = vec![0u8; 1 << 20];
+    while z.len() < 2 * want {
+        let n = f.read(&mut buf).unwrap();
+        assert!(n > 0, "{path}: fewer than 50 frames");
+        r.feed_bytes(&buf[..n], &mut ev);
+        for e in ev.drain(..) {
+            if let Event::Block { symbols, .. } = e {
+                z.extend(
+                    symbols
+                        .iter()
+                        .map(|s| Cplx::new(f64::from(s[0]), f64::from(s[1]))),
+                );
+            }
+        }
+    }
+    let opt = RxOptions::default();
+    let first = receive(&z[..want], &opt);
+    let ok = first.frames.iter().filter(|f| f.tmcc.is_ok()).count();
+    assert!(
+        first.frames.len() >= 23 && ok == first.frames.len(),
+        "{path}: {} frames, TMCC ok {ok}, residual carrier {:?} Hz",
+        first.frames.len(),
+        first.residual_hz
+    );
+    // the next chunk, with the reported carrier removed as a stream does
+    let hz = first.residual_hz.expect("residual");
+    let next = receive(
+        &z[want..],
+        &RxOptions {
+            carrier_hz: hz,
+            ..RxOptions::default()
+        },
+    );
+    let ok = next.frames.iter().filter(|f| f.tmcc.is_ok()).count();
+    assert!(
+        next.frames.len() >= 23 && ok == next.frames.len(),
+        "{path}: next chunk at {hz:+.1} Hz: {} frames, TMCC ok {ok}",
+        next.frames.len()
+    );
+    let left = next.residual_hz.expect("residual");
+    assert!(
+        left.abs() < 100.0,
+        "{path}: {left:+.1} Hz left after removing {hz:+.1} Hz"
+    );
+}

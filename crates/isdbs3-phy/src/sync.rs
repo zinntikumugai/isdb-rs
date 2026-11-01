@@ -16,7 +16,10 @@
 
 use crate::Cplx;
 use isdb_frontend::s3sync::{self, SYNC_LEN, sync_symbols};
-use isdbs3_core::params::{FRAME_SYMBOLS, FSYNC, MOD_SLOT, SLOTS, SSYNC};
+use isdbs3_core::params::{
+    FRAME_SYMBOLS, FSYNC, MAIN_RUN, MOD_SLOT, PILOT_SYMBOLS, RUNS, SLOTS, SSYNC, SYMBOL_RATE,
+    SYNC_SYMBOLS, TMCC_RUN,
+};
 
 /// One modulation slot found in the symbol stream.
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +154,69 @@ pub fn residual_hz(s: &Synced) -> Option<f64> {
     })
 }
 
+/// Spacing of the carrier offsets [`residual_hz`] cannot tell apart, Hz:
+/// Rs / (2 · 9 296) ≈ 1 815.6 Hz (one turn per SSync-to-SSync step).
+pub const ALIAS_HZ: f64 = SYMBOL_RATE / (2.0 * MOD_SLOT as f64);
+
+/// A coarse carrier offset of the symbols `s` was measured on, Hz, from
+/// their TMCC symbols: π/2-shift BPSK (§3.8), whose square carries no data,
+/// in runs of 4 every 140 symbols; the mean phase step of the squared runs
+/// from one run to the next in each slot is 2 · 2π · f · 140 / Rs.
+/// Unambiguous within ±Rs / (4 · 140) ≈ ±60 kHz, and a few Hz accurate on
+/// a frame of slots at the Es/N0 of a live stream, so it tells which of
+/// [`residual_hz`]'s aliases ([`ALIAS_HZ`] apart) is the carrier. `None`
+/// without a whole slot.
+pub fn coarse_hz(z: &[Cplx], s: &Synced) -> Option<f64> {
+    const STEP: usize = MAIN_RUN + TMCC_RUN;
+    // the square of the bit-0 point: j on an even slot symbol, −j on an
+    // odd one (`tmcc::bpsk_soft`)
+    let sq0 = |j: usize| {
+        if j.is_multiple_of(2) {
+            Cplx::new(0.0, 1.0)
+        } else {
+            Cplx::new(0.0, -1.0)
+        }
+    };
+    let mut acc = Cplx::new(0.0, 0.0);
+    for h in s.slots.iter().take_while(|h| h.at + MOD_SLOT <= z.len()) {
+        let mut prev: Option<Cplx> = None;
+        for r in 0..RUNS {
+            let j0 = SYNC_SYMBOLS + PILOT_SYMBOLS + r * STEP + MAIN_RUN;
+            let run: Cplx = (j0..j0 + TMCC_RUN)
+                .map(|j| {
+                    let v = z[h.at + j];
+                    v * v * sq0(j).conj()
+                })
+                .sum();
+            if let Some(p) = prev {
+                acc += run * p.conj();
+            }
+            prev = Some(run);
+        }
+    }
+    (acc.norm() > 0.0)
+        .then(|| acc.arg() * SYMBOL_RATE / (2.0 * std::f64::consts::TAU * STEP as f64))
+}
+
+/// The carrier offset of the symbols `s` was measured on, Hz: the alias of
+/// [`residual_hz`] (precise, but ambiguous by multiples of [`ALIAS_HZ`])
+/// nearest [`coarse_hz`] (unambiguous). The residual as it is when the
+/// coarse estimate falls near the middle between two aliases (within a
+/// quarter of their spacing of it: no clear choice) or is missing.
+pub fn carrier_hz(z: &[Cplx], s: &Synced) -> Option<f64> {
+    let fine = residual_hz(s)?;
+    let Some(coarse) = coarse_hz(z, s) else {
+        return Some(fine);
+    };
+    let k = ((coarse - fine) / ALIAS_HZ).round();
+    let off = coarse - fine - k * ALIAS_HZ;
+    Some(if off.abs() < ALIAS_HZ / 4.0 {
+        fine + k * ALIAS_HZ
+    } else {
+        fine
+    })
+}
+
 /// The carrier phase at symbol `j` (0 … 9 295) of slot `i`, interpolated
 /// linearly between slot `i`'s head and the next one's (held after the
 /// last slot), and the amplitude likewise.
@@ -206,7 +272,7 @@ mod tests {
     /// `frames` frames of slots: each slot its sync word (FSync on slot #1,
     /// !FSync on the other odd slots, SSync on the even ones — the sign
     /// structure the synchronisation reads), then QPSK-like filler from a
-    /// fixed LCG, all at unit amplitude plus Gaussian-ish noise; `lead`
+    /// fixed LCG with π/2-shift BPSK on the TMCC symbols, all at unit amplitude plus Gaussian-ish noise; `lead`
     /// filler symbols first, so the first slot head is not at 0. Rotated by
     /// `hz` (symbol n × e^{j2π·hz·n/Rs}).
     fn stream(frames: usize, lead: usize, hz: f64) -> (Vec<Cplx>, Vec<usize>) {
@@ -253,8 +319,16 @@ mod tests {
                     _ => &ss,
                 };
                 z.extend_from_slice(w);
-                for _ in SYNC_LEN..MOD_SLOT {
-                    z.push(filler(&mut rnd));
+                let tmcc: Vec<usize> = crate::tmcc::tmcc_offsets().collect();
+                for j in SYNC_LEN..MOD_SLOT {
+                    if tmcc.binary_search(&j).is_ok() {
+                        // π/2-shift BPSK, as the TMCC is (§3.8)
+                        let b = if rnd() & 1 == 0 { 1.0 } else { -1.0 };
+                        let a = if j % 2 == 0 { 1.0 } else { 3.0 };
+                        z.push(Cplx::from_polar(b, a * std::f64::consts::FRAC_PI_4));
+                    } else {
+                        z.push(filler(&mut rnd));
+                    }
                 }
             }
         }
@@ -311,5 +385,32 @@ mod tests {
         // and well beyond it the common flip keeps the minority rule right
         let (z, heads) = stream(3, 1_000, 1_400.0);
         assert_eq!(found_heads(&z), heads, "1 400 Hz");
+    }
+
+    /// Beyond ±908 Hz the SSync phase steps measure an alias of the
+    /// carrier, [`ALIAS_HZ`] apart (a 12 s slice from the middle of a
+    /// 3-hour BS-14 recording, 2026-11-01: +2 539 Hz measured as +723 Hz,
+    /// another +9 220 Hz as +142 Hz, and no TMCC decoded). The TMCC
+    /// symbols' estimate tells the aliases apart: [`carrier_hz`] gives the
+    /// carrier, within the unambiguous range as well as far beyond it.
+    #[test]
+    fn carrier_beyond_the_alias_spacing_is_resolved() {
+        assert!((ALIAS_HZ - 1815.6).abs() < 0.1, "{ALIAS_HZ}");
+        for hz in [
+            0.0, 300.0, -600.0, 1_400.0, 2_539.0, -1_092.0, 9_220.0, -14_000.0, 40_000.0,
+        ] {
+            let (z, _) = stream(2, 1_000, hz);
+            let s = synchronise(&z).expect("slot sync");
+            let r = residual_hz(&s).unwrap();
+            let k = ((hz - r) / ALIAS_HZ).round();
+            assert!(
+                (r + k * ALIAS_HZ - hz).abs() < 5.0,
+                "{hz} Hz: residual {r:.1} Hz"
+            );
+            let c = coarse_hz(&z, &s).unwrap();
+            assert!((c - hz).abs() < 100.0, "{hz} Hz: coarse {c:.1} Hz");
+            let f = carrier_hz(&z, &s).unwrap();
+            assert!((f - hz).abs() < 5.0, "{hz} Hz: carrier {f:.1} Hz");
+        }
     }
 }

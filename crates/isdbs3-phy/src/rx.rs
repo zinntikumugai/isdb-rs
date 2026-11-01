@@ -240,8 +240,10 @@ impl Front {
 /// equaliser and the TMCCs): everything up to the main signal's decode.
 pub fn receive_front(z: &[Cplx], opt: &RxOptions) -> Front {
     let t0 = std::time::Instant::now();
+    let input = z;
     let derotated;
-    let z: &[Cplx] = if opt.carrier_hz == 0.0 {
+    let realigned;
+    let mut z: &[Cplx] = if opt.carrier_hz == 0.0 {
         z
     } else {
         derotated = derotate(z, opt.carrier_hz);
@@ -254,7 +256,7 @@ pub fn receive_front(z: &[Cplx], opt: &RxOptions) -> Front {
         .and_then(|o| synchronise_at(z, o))
         .filter(|s| s.sync_snr_db > HINT_MIN_SNR_DB);
     let continuation = hinted.is_some();
-    let Some(sy0) = hinted.or_else(|| synchronise(z)) else {
+    let Some(mut sy0) = hinted.or_else(|| synchronise(z)) else {
         info!(
             symbols = z.len(),
             carrier_hz = opt.carrier_hz,
@@ -266,7 +268,35 @@ pub fn receive_front(z: &[Cplx], opt: &RxOptions) -> Front {
             ..Rx::default()
         });
     };
-    let residual_hz = crate::sync::residual_hz(&sy0);
+    let mut residual_hz = crate::sync::residual_hz(&sy0);
+    // A stream that is not continuing may start anywhere in the carrier's
+    // drift: beyond ±908 Hz the residual is an alias (ALIAS_HZ apart),
+    // the FSync-parity slots' phases come out a half turn off (or the phase
+    // turns whole times per slot unseen) and no TMCC decodes, however long
+    // the stream is tracked on that alias. Take the alias the TMCC symbols
+    // point at, remove it and measure again. (A continuing stream tracks
+    // its drift from call to call, well inside the range.)
+    if !continuation
+        && sy0.sync_snr_db > HINT_MIN_SNR_DB
+        && let (Some(fine), Some(carrier)) = (residual_hz, crate::sync::carrier_hz(z, &sy0))
+        && carrier != fine
+        && let Some(sy) = {
+            realigned = derotate(input, opt.carrier_hz + carrier - fine);
+            synchronise_at(&realigned, sy0.offset)
+        }
+    {
+        let left = crate::sync::residual_hz(&sy);
+        info!(
+            measured_hz = fine,
+            carrier_hz = carrier,
+            residual_hz = left.unwrap_or(f64::NAN),
+            "residual carrier {fine:+.1} Hz is an alias of {carrier:+.1} Hz (from the TMCC symbols; aliases {:.1} Hz apart): removed",
+            crate::sync::ALIAS_HZ
+        );
+        residual_hz = left.map(|r| r + carrier - fine);
+        sy0 = sy;
+        z = &realigned;
+    }
     if continuation {
         debug!(
             offset = sy0.offset,
