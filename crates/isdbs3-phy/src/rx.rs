@@ -115,6 +115,13 @@ pub struct Rx {
     /// was removed, Hz, from the phase steps between SSync slots (`None`
     /// without enough of them). Add it to `carrier_hz` for the next block.
     pub residual_hz: Option<f64>,
+    /// Seconds spent before the main signal's decode: derotation, slot
+    /// sync, equaliser, each frame's TMCC and symbols (for the caller's
+    /// timing report only).
+    pub prep_s: f64,
+    /// Seconds spent in the main signal's decode: noise, demapper, LDPC
+    /// and BCH (see `prep_s`).
+    pub ldpc_s: f64,
 }
 
 /// Lowest sync-symbol Es/N0 at which [`RxOptions::slot_offset`] is
@@ -165,7 +172,69 @@ fn assignment_differs(a: &TmccInfo, b: &TmccInfo) -> bool {
 /// through [`describe_tmcc`]); the other frames' TMCCs, a TMCC that did
 /// not decode, each frame's LDPC / BCH failure counts and the block's
 /// totals are `debug!`.
+///
+/// It is [`receive_front`] then [`receive_back`]; a streaming caller may
+/// run the two on different threads to overlap one block's sync with the
+/// previous block's decode.
 pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
+    receive_back(receive_front(z, opt), opt)
+}
+
+/// A block of symbols through [`receive_front`]: synchronised, equalised
+/// and each frame's TMCC, main symbols and pilots taken out, the main
+/// signal not yet decoded. It owns what it holds (no borrow of the
+/// symbols).
+#[derive(Debug)]
+pub struct Front {
+    /// What is known before the decode: the sync, the equaliser, the frame
+    /// starts, the residual carrier (`slots` and the frames' MER are
+    /// filled in by [`receive_back`]).
+    rx: Rx,
+    /// A frame without slots, or `None` for the next of `ready`.
+    order: Vec<Option<RxFrame>>,
+    ready: Vec<Ready>,
+    /// Symbols in the block.
+    symbols: usize,
+    /// The front stopped early (no sync): `rx` is the result as it is.
+    early: bool,
+}
+
+impl Front {
+    fn early(rx: Rx) -> Self {
+        Self {
+            rx,
+            order: Vec::new(),
+            ready: Vec::new(),
+            symbols: 0,
+            early: true,
+        }
+    }
+
+    /// [`Rx::frame_starts`], known before the decode.
+    pub fn frame_starts(&self) -> &[usize] {
+        &self.rx.frame_starts
+    }
+
+    /// [`Rx::residual_hz`], known before the decode.
+    pub fn residual_hz(&self) -> Option<f64> {
+        self.rx.residual_hz
+    }
+
+    /// [`Rx::sync_snr_db`], known before the decode.
+    pub fn sync_snr_db(&self) -> f64 {
+        self.rx.sync_snr_db
+    }
+
+    /// [`Rx::sync_snr_eq_db`], known before the decode.
+    pub fn sync_snr_eq_db(&self) -> Option<f64> {
+        self.rx.sync_snr_eq_db
+    }
+}
+
+/// The first half of [`receive`] (its events are those of the sync, the
+/// equaliser and the TMCCs): everything up to the main signal's decode.
+pub fn receive_front(z: &[Cplx], opt: &RxOptions) -> Front {
+    let t0 = std::time::Instant::now();
     let derotated;
     let z: &[Cplx] = if opt.carrier_hz == 0.0 {
         z
@@ -187,7 +256,10 @@ pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
             "no slot sync in {} symbols",
             z.len()
         );
-        return Rx::default();
+        return Front::early(Rx {
+            prep_s: t0.elapsed().as_secs_f64(),
+            ..Rx::default()
+        });
     };
     let residual_hz = crate::sync::residual_hz(&sy0);
     if continuation {
@@ -253,7 +325,8 @@ pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
         // the slot heads are where they were, only their phases and the
         // SNR change
         let Some(s) = synchronise_at(z, sy0.offset) else {
-            return rx;
+            rx.prep_s = t0.elapsed().as_secs_f64();
+            return Front::early(rx);
         };
         debug!(
             taps = rx.taps.len(),
@@ -347,6 +420,30 @@ pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
             }
         }
     }
+    rx.prep_s = t0.elapsed().as_secs_f64();
+    Front {
+        rx,
+        order,
+        ready,
+        symbols: z.len(),
+        early: false,
+    }
+}
+
+/// The second half of [`receive`]: the main signal of each frame
+/// [`receive_front`] made ready, decoded (`opt` as given to it).
+pub fn receive_back(front: Front, opt: &RxOptions) -> Rx {
+    let t1 = std::time::Instant::now();
+    let Front {
+        mut rx,
+        order,
+        ready,
+        symbols,
+        early,
+    } = front;
+    if early {
+        return rx;
+    }
     let pts: Vec<_> = ready
         .iter()
         .map(|(_, _, _, lay, _, pil)| {
@@ -434,7 +531,7 @@ pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
         });
     }
     debug!(
-        symbols = z.len(),
+        symbols,
         frames = rx.frames.len(),
         tmcc_ok = rx.frames.iter().filter(|f| f.tmcc.is_ok()).count(),
         slots = rx.slots.len(),
@@ -442,7 +539,7 @@ pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
         sync_snr_db = rx.sync_snr_db,
         sync_snr_eq_db = rx.sync_snr_eq_db.unwrap_or(f64::NAN),
         "{} symbols: {} frames, TMCC ok {}; {} slots, {} failed; sync Es/N0 {:.1} dB{}",
-        z.len(),
+        symbols,
         rx.frames.len(),
         rx.frames.iter().filter(|f| f.tmcc.is_ok()).count(),
         rx.slots.len(),
@@ -451,6 +548,7 @@ pub fn receive(z: &[Cplx], opt: &RxOptions) -> Rx {
         rx.sync_snr_eq_db
             .map_or(String::new(), |e| format!(" ({e:.1} dB equalised)"))
     );
+    rx.ldpc_s = t1.elapsed().as_secs_f64();
     rx
 }
 
@@ -609,5 +707,30 @@ mod tests {
                 "length {len}"
             );
         }
+    }
+    /// An `Rx` as text without its timings, for comparing two runs.
+    fn untimed(mut r: Rx) -> String {
+        r.prep_s = 0.0;
+        r.ldpc_s = 0.0;
+        format!("{r:?}")
+    }
+
+    /// [`receive`] is [`receive_front`] then [`receive_back`] on symbols
+    /// that are no ISDB-S3 signal (whatever path the front takes on them;
+    /// a real stream is the opt-in test in tests/captures.rs).
+    #[test]
+    fn front_then_back_is_receive_on_junk() {
+        let n = 3 * isdbs3_core::params::FRAME_SYMBOLS;
+        let z: Vec<Cplx> = (0..n)
+            .map(|k| {
+                Cplx::new(
+                    ((k * 7919) % 13) as f64 - 6.0,
+                    ((k * 104_729) % 11) as f64 - 5.0,
+                )
+            })
+            .collect();
+        let opt = RxOptions::default();
+        let f = receive_front(&z, &opt);
+        assert_eq!(untimed(receive_back(f, &opt)), untimed(receive(&z, &opt)));
     }
 }

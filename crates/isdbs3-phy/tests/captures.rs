@@ -223,3 +223,57 @@ fn isdbs3_carrier_beats_the_survey_aliases() {
         );
     }
 }
+
+/// `rx::receive` is `receive_front` then `receive_back` on a live stream's
+/// symbols: `ISDB_RS_ISDBS3_WORDS` names a words file (`isdb symbols
+/// --out`), of which the first 25 frames are received both ways and must
+/// give the same result (timings aside).
+#[test]
+fn isdbs3_front_then_back_is_receive_on_words() {
+    use isdb_frontend::format::{Event, Reader};
+    use isdbs3_core::params::FRAME_SYMBOLS;
+    use isdbs3_phy::Cplx;
+    use isdbs3_phy::rx::{receive_back, receive_front};
+    use std::io::Read;
+    let Ok(path) = std::env::var("ISDB_RS_ISDBS3_WORDS") else {
+        eprintln!("SKIP isdbs3_front_then_back_is_receive_on_words: ISDB_RS_ISDBS3_WORDS not set");
+        return;
+    };
+    let want = 25 * FRAME_SYMBOLS;
+    let mut f = std::fs::File::open(&path).unwrap();
+    let (mut r, mut ev, mut z) = (Reader::new(), Vec::new(), Vec::<Cplx>::new());
+    let mut buf = vec![0u8; 1 << 20];
+    while z.len() < want {
+        let n = f.read(&mut buf).unwrap();
+        assert!(n > 0, "{path}: fewer than 25 frames");
+        r.feed_bytes(&buf[..n], &mut ev);
+        for e in ev.drain(..) {
+            if let Event::Block { symbols, .. } = e {
+                z.extend(
+                    symbols
+                        .iter()
+                        .map(|s| Cplx::new(f64::from(s[0]), f64::from(s[1]))),
+                );
+            }
+        }
+    }
+    z.truncate(want);
+    let untimed = |mut r: isdbs3_phy::rx::Rx| {
+        r.prep_s = 0.0;
+        r.ldpc_s = 0.0;
+        format!("{r:?}")
+    };
+    let opt = RxOptions::default();
+    let whole = receive(&z, &opt);
+    assert!(
+        whole.frames.len() >= 23,
+        "{path}: {} frames",
+        whole.frames.len()
+    );
+    assert!(
+        whole.slots.iter().all(|s| s.data.is_some()),
+        "{path}: failed slots"
+    );
+    let halves = receive_back(receive_front(&z, &opt), &opt);
+    assert_eq!(untimed(halves), untimed(whole), "{path}");
+}
