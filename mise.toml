@@ -1,8 +1,9 @@
 # Tool versions for the repository harness (hooks, CI linters, cargo-deny)
-# and the task runner for every check. The Rust toolchain itself is pinned
-# in rust-toolchain.toml (rustup); the Rust build/check tasks below are
-# plain cargo/rustup underneath, so they need nothing beyond that toolchain
-# plus cargo-deny for `deny` / `deny-offline` (`mise install`, or
+# and the task runner for every check. The Rust toolchain is pinned in
+# rust-toolchain.toml (rustup); `rust` below installs the same toolchain
+# through mise (rustup underneath), so `mise install` alone sets up a
+# machine to build. Keep its version in step with rust-toolchain.toml.
+# cargo-deny serves `deny` / `deny-offline` (`mise install`, or
 # `cargo install --locked cargo-deny`). `mise tasks` lists every task.
 #
 #   mise run check   everything CI runs: lint, features, test, doc, deny,
@@ -12,6 +13,8 @@
 # `depends` run in parallel (cargo serialises jobs that share a target
 # directory); every task is self-contained, so the order does not matter.
 [tools]
+# the same toolchain as rust-toolchain.toml
+rust = { version = "1.99.1", components = "rustfmt,clippy", profile = "minimal" }
 node = "24"
 pnpm = "12.16.1"
 lefthook = "2.2.2"
