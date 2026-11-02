@@ -2,22 +2,34 @@
 # Usage: tools/split-rx.sh FILE.sym PARTS JOBS [OUTDIR]
 #
 # Decode an ISDB-S3 Symbols words file in PARTS slices, JOBS of them at a
-# time, and join the part TLVs in order into OUTDIR/<name>-<tlv_id>.tlv.
+# time, and join the part TLVs into OUTDIR/<name>-<tlv_id>.tlv, byte for
+# byte what one receiver over the whole file writes.
 #
 # - Slices start on 4096-byte boundaries (L = size / PARTS rounded down to
 #   4096; the last part takes the remainder) and are fed through process
 #   substitution, so there is no sidecar: --system isdbs3 is passed.
+# - Every slice but the last is decoded OVERLAP_BYTES further, so the frame
+#   that straddles a slice boundary is decoded whole by the earlier part and
+#   the later part's first frames are in both. tools/tlv-join.py finds where
+#   part k+1's TLV starts inside the tail of part k (anchored at a TLV packet
+#   boundary, unique, several anchors tried in case the decodes differ near
+#   the head) and joins there. A seam without a match fails the join and
+#   keeps the parts, unless ALLOW_LOSSY=1 (that seam is then a plain
+#   concatenation, repeating the overlap).
 # - Each slice needs a receiver that acquires mid-recording (isdb-rs
 #   fix/mid-file-start: the carrier alias is resolved from the TMCC).
 # - Parts and logs go to OUTDIR (default: next to FILE). Nothing existing is
 #   overwritten: the script refuses to start if a joined TLV or any part
-#   file is already there, and checks again before each join.
+#   file is already there, and checks again before each join; the joined
+#   file is linked into place without clobbering.
 # - Every part must end with "TMCC ok N" with N > 0, else the script fails
 #   without joining.
-# - Each seam loses the frame that straddles it (~1 frame, 33 ms).
 #
 # Env: ISDB (receiver binary, default target/release/isdb of this checkout),
-#      ISDB_RX_ARGS (extra rx arguments).
+#      ISDB_RX_ARGS (extra rx arguments),
+#      OVERLAP_BYTES (extra bytes decoded past each slice, multiple of 4096,
+#        default 8 MiB = about 5 frames; 0 only with ALLOW_LOSSY=1),
+#      ALLOW_LOSSY=1 (join a seam without a match by concatenation).
 set -euo pipefail
 
 usage() { echo "usage: $0 FILE.sym PARTS JOBS [OUTDIR]" >&2; exit 2; }
@@ -28,6 +40,14 @@ ISDB=${ISDB:-$(cd -- "$(dirname -- "$0")/.." && pwd)/target/release/isdb}
 [[ $N =~ ^[1-9][0-9]*$ && $J =~ ^[1-9][0-9]*$ ]] || usage
 [ -r "$F" ] || { echo "error: cannot read $F" >&2; exit 1; }
 [ -x "$ISDB" ] || { echo "error: receiver $ISDB not executable" >&2; exit 1; }
+OV=${OVERLAP_BYTES:-8388608}
+LOSSY=${ALLOW_LOSSY:-0}
+[[ $OV =~ ^[0-9]+$ ]] && [ $(( OV % 4096 )) -eq 0 ] \
+    || { echo "error: OVERLAP_BYTES=$OV is not a multiple of 4096" >&2; exit 1; }
+[ "$OV" -gt 0 ] || [ "$LOSSY" = 1 ] \
+    || { echo "error: OVERLAP_BYTES=0 loses a frame per seam; set ALLOW_LOSSY=1 to accept that" >&2; exit 1; }
+JOIN=$(cd -- "$(dirname -- "$0")" && pwd)/tlv-join.py
+[ -r "$JOIN" ] || { echo "error: $JOIN missing" >&2; exit 1; }
 mkdir -p -- "$OUT"
 B=$OUT/$(basename -- "$F" .sym)
 
@@ -42,11 +62,16 @@ fi
 size=$(stat -c %s -- "$F")
 L=$(( size / N / 4096 * 4096 ))
 [ "$L" -gt 0 ] || { echo "error: $F too small for $N parts" >&2; exit 1; }
-echo "[split] $F: $size bytes, $N parts of $L bytes (last: $(( size - (N - 1) * L ))), $J at a time -> $OUT"
+echo "[split] $F: $size bytes, $N parts of $L bytes (last: $(( size - (N - 1) * L ))) + $OV overlap, $J at a time -> $OUT"
 
 part() {
     local i=$1 off=$(( $1 * L )) cnt=$L
-    [ "$i" -eq $(( N - 1 )) ] && cnt=$(( size - off ))
+    if [ "$i" -eq $(( N - 1 )) ]; then
+        cnt=$(( size - off ))
+    else
+        cnt=$(( L + OV ))
+        [ $(( off + cnt )) -le "$size" ] || cnt=$(( size - off ))
+    fi
     # shellcheck disable=SC2086
     "$ISDB" rx --system isdbs3 ${ISDB_RX_ARGS:-} \
         --symbols <(dd if="$F" bs=4M iflag=skip_bytes,count_bytes skip="$off" count="$cnt" status=none) \
@@ -95,7 +120,17 @@ for id in $ids; do
         if [ -e "$p" ]; then list+=( "$p" ); else echo "[split] warning: part $i has no stream $id" >&2; fi
     done
     tmp=$(mktemp -- "$target.joining.XXXXXX")
-    cat -- "${list[@]}" > "$tmp"
+    if [ "$OV" -eq 0 ]; then
+        cat -- "${list[@]}" > "$tmp"
+    else
+        lossy=()
+        [ "$LOSSY" = 1 ] && lossy=( --allow-lossy )
+        if ! python3 "$JOIN" --tail $(( OV + 2097152 )) "${lossy[@]}" --out "$tmp" "${list[@]}"; then
+            rm -f -- "$tmp"
+            echo "[split] FAILED: stream $id not joined; parts kept" >&2
+            exit 1
+        fi
+    fi
     chmod --reference="${list[0]}" -- "$tmp"
     # no-clobber rename: fails if the target appeared meanwhile
     if ! ln -- "$tmp" "$target" 2>/dev/null; then
