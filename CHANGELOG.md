@@ -17,6 +17,13 @@ STD-B44) is received to TLV streams.
 
 ### Added
 
+- Tools: `tools/split-rx.sh FILE.sym OUT [PARTS] [JOBS]` decodes a long
+  ISDB-S3 `Symbols` recording in parallel slices and joins the part TLVs
+  losslessly with `tools/tlv-join.py` (every slice but the last decoded
+  `OVERLAP_BYTES` past its end; the join finds part k+1's start in part
+  k's tail and fails on a seam without a match unless `ALLOW_LOSSY=1`).
+  Self-test: `tools/tlv-join-test.py`.
+
 - ISDB-S3 reception from the FPGA receive chain's `Slots` words
   (docs/plans/isdbs3-fpga-rx.md piece 5, host side; no image has the
   chain yet): `isdb rx --slots FILE`, `isdb rx --symbols FILE --chain
@@ -903,6 +910,15 @@ STD-B44) is received to TLV streams.
 
 ### Changed
 
+- `isdb rx` (ISDB-S3, streamed `Symbols`): each chunk's sync, equaliser,
+  TMCC and symbols run on the stream's thread while the calling thread
+  decodes the previous chunk's LDPC/BCH and writes its TLV packets, in
+  order (`isdbs3_phy::rx::receive_front` / `receive_back`); the summary
+  gains a `stages` line. With the unrolled max-log demapper, one
+  interleaver table per mode, a byte-wise codeword check before the BCH
+  syndromes and the per-slot phase step taken once per slot, 1 minute of
+  BS-14 decodes in 244.5 s instead of 297.6 s on 4 cores, byte-identical.
+
 - `isdb-cli`: the ISDB-T `isdb tx --mux-config` and `isdb loopback
   --mux-config` refuse a `[network] kind = "bs"` configuration (a
   satellite NIT on an ISDB-T signal), naming `isdb tx --system isdbs
@@ -1447,6 +1463,15 @@ STD-B44) is received to TLV streams.
   override of the Makefile is gone.
 
 ### Fixed
+
+- `isdbs3-phy`: a stream acquired far from the front end's NCO (a slice
+  from the middle of a long recording whose carrier had drifted by
+  kilohertz) never decoded a TMCC: the residual carrier from the SSync
+  phase step is unambiguous only within ±908 Hz, and the sync took an
+  alias 1815.6 Hz apart and tracked it. An acquisition now estimates the
+  carrier coarsely from the squared π/2-BPSK TMCC symbols (±60 kHz) and
+  takes the residual's alias nearest it. Opt-in test
+  `isdbs3_mid_file_slice_acquires` (`ISDB_RS_ISDBS3_MIDFILE_WORDS`).
 
 - `tools/ts-align-compare.py` aligned on the first recording packet whose
   bytes occur once in the reference, which with a looped placed TS could
